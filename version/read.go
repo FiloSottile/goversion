@@ -7,6 +7,7 @@ package version
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -32,30 +33,16 @@ func ReadExe(file string) (Version, error) {
 		return v, err
 	}
 	defer f.Close()
-	isGo := false
-	for _, name := range f.SectionNames() {
-		if name == ".note.go.buildid" {
-			isGo = true
-		}
-	}
-	syms, symsErr := f.Symbols()
-	isGccgo := false
-	for _, sym := range syms {
-		name := sym.Name
-		if name == "runtime.main" || name == "main.main" {
-			isGo = true
-		}
-		if strings.HasPrefix(name, "runtime.") && strings.HasSuffix(name, "$descriptor") {
-			isGccgo = true
-		}
-		if name == "runtime.buildVersion" {
-			isGo = true
-			release, err := readBuildVersion(f, sym.Addr, sym.Size)
-			if err != nil {
-				return v, err
-			}
-			v.Release = release
 
+	syms, _ := f.Symbols()
+	for _, name := range syms {
+		if strings.HasPrefix(name, "runtime.") && strings.HasSuffix(name, "$descriptor") {
+			defer func() {
+				if v.Release == "" || v.Release == "unknown Go version" {
+					v.Release = "gccgo (version unknown)"
+					err = nil
+				}
+			}()
 		}
 		if strings.Contains(name, "_Cfunc__goboringcrypto_") || name == "crypto/internal/boring/sig.BoringCrypto" {
 			v.BoringCrypto = true
@@ -73,37 +60,71 @@ func ReadExe(file string) (Version, error) {
 		}
 	}
 
-	if DebugMatch {
-		v.Release = ""
-	}
-	if err := findModuleInfo(&v, f); err != nil {
+	if err := findCryptoSigs(&v, f); err != nil {
 		return v, err
 	}
-	if v.Release == "" {
-		g, release := readBuildVersionX86Asm(f)
-		if g {
-			isGo = true
-			v.Release = release
-			if err := findCryptoSigs(&v, f); err != nil {
-				return v, err
-			}
+
+	// The build info blob left by the linker is identified by
+	// a 16-byte header, consisting of buildInfoMagic (14 bytes),
+	// the binary's pointer size (1 byte),
+	// and whether the binary is big endian (1 byte).
+	var buildInfoMagic = []byte("\xff Go buildinf:")
+
+	// Read the first 64kB of text to find the build info blob.
+	text := f.DataStart()
+	data, err := f.ReadData(text, 64*1024)
+	if err != nil {
+		return v, err
+	}
+	for ; !bytes.HasPrefix(data, buildInfoMagic); data = data[32:] {
+		if len(data) < 32 {
+			return v, errors.New("not a Go executable")
 		}
 	}
-	if isGccgo && v.Release == "" {
-		isGo = true
-		v.Release = "gccgo (version unknown)"
-	}
-	if !isGo && symsErr != nil {
-		return v, symsErr
-	}
 
-	if !isGo {
-		return v, errors.New("not a Go executable")
+	// Decode the blob.
+	ptrSize := int(data[14])
+	bigEndian := data[15] != 0
+	var bo binary.ByteOrder
+	if bigEndian {
+		bo = binary.BigEndian
+	} else {
+		bo = binary.LittleEndian
 	}
+	var readPtr func([]byte) uint64
+	if ptrSize == 4 {
+		readPtr = func(b []byte) uint64 { return uint64(bo.Uint32(b)) }
+	} else {
+		readPtr = bo.Uint64
+	}
+	v.Release = readString(f, ptrSize, readPtr, readPtr(data[16:]))
 	if v.Release == "" {
 		v.Release = "unknown Go version"
 	}
+	v.ModuleInfo = readString(f, ptrSize, readPtr, readPtr(data[16+ptrSize:]))
+	if len(v.ModuleInfo) >= 33 && v.ModuleInfo[len(v.ModuleInfo)-17] == '\n' {
+		// Strip module framing.
+		v.ModuleInfo = v.ModuleInfo[16 : len(v.ModuleInfo)-16]
+	} else {
+		v.ModuleInfo = ""
+	}
+
 	return v, nil
+}
+
+// readString returns the string at address addr in the executable x.
+func readString(x exe, ptrSize int, readPtr func([]byte) uint64, addr uint64) string {
+	hdr, err := x.ReadData(addr, uint64(2*ptrSize))
+	if err != nil || len(hdr) < 2*ptrSize {
+		return ""
+	}
+	dataAddr := readPtr(hdr)
+	dataLen := readPtr(hdr[ptrSize:])
+	data, err := x.ReadData(dataAddr, dataLen)
+	if err != nil || uint64(len(data)) < dataLen {
+		return ""
+	}
+	return string(data)
 }
 
 var re = regexp.MustCompile
@@ -114,36 +135,6 @@ var standardCryptoNames = []*regexp.Regexp{
 	re(`^crypto/rand\.\(\*devReader\)`),
 	re(`^crypto/rsa\.encrypt$`),
 	re(`^crypto/rsa\.decrypt$`),
-}
-
-func readBuildVersion(f exe, addr, size uint64) (string, error) {
-	if size == 0 {
-		size = uint64(f.AddrSize() * 2)
-	}
-	if size != 8 && size != 16 {
-		return "", fmt.Errorf("invalid size for runtime.buildVersion")
-	}
-	data, err := f.ReadData(addr, size)
-	if err != nil {
-		return "", fmt.Errorf("reading runtime.buildVersion: %v", err)
-	}
-
-	if size == 8 {
-		addr = uint64(f.ByteOrder().Uint32(data))
-		size = uint64(f.ByteOrder().Uint32(data[4:]))
-	} else {
-		addr = f.ByteOrder().Uint64(data)
-		size = f.ByteOrder().Uint64(data[8:])
-	}
-	if size > 1000 {
-		return "", fmt.Errorf("implausible string size %d for runtime.buildVersion", size)
-	}
-
-	data, err = f.ReadData(addr, size)
-	if err != nil {
-		return "", fmt.Errorf("reading runtime.buildVersion string data: %v", err)
-	}
-	return string(data), nil
 }
 
 // Code signatures that indicate BoringCrypto or crypto/internal/fipsonly.
@@ -199,45 +190,4 @@ func haveSig(data, sig []byte) bool {
 		// skip to next aligned boundary and keep searching.
 		data = data[(i+align-1)&^(align-1):]
 	}
-}
-
-func findModuleInfo(v *Version, f exe) error {
-	const maxModInfo = 128 << 10
-	start, end := f.RODataRange()
-	for addr := start; addr < end; {
-		size := uint64(4 << 20)
-		if end-addr < size {
-			size = end - addr
-		}
-		data, err := f.ReadData(addr, size)
-		if err != nil {
-			return fmt.Errorf("reading text: %v", err)
-		}
-		if haveModuleInfo(data, v) {
-			return nil
-		}
-		if addr+size < end {
-			size -= maxModInfo
-		}
-		addr += size
-	}
-	return nil
-}
-
-var (
-	infoStart, _ = hex.DecodeString("3077af0c9274080241e1c107e6d618e6")
-	infoEnd, _   = hex.DecodeString("f932433186182072008242104116d8f2")
-)
-
-func haveModuleInfo(data []byte, v *Version) bool {
-	i := bytes.Index(data, infoStart)
-	if i < 0 {
-		return false
-	}
-	j := bytes.Index(data[i:], infoEnd)
-	if j < 0 {
-		return false
-	}
-	v.ModuleInfo = string(data[i+len(infoStart) : i+j])
-	return true
 }
